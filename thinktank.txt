@@ -1,0 +1,130 @@
+thinktank.py — Design Spec
+==========================
+
+CONCEPT
+-------
+IRC-style multi-agent chat in ncurses. Multiple Claude participants, each with their
+own system prompt and persona. User posts messages; all active participants respond in
+parallel via asyncio. When the first response lands, remaining in-flight streams are
+cancelled and restarted with the new message in context (cancel-and-restart strategy).
+Prefill continuation (saving partial text as assistant prefill) is available on
+non-Opus-4.6 models only.
+
+
+UI (ncurses)
+------------
+- Scroll buffer (main area): timestamped IRC-style messages  <HH:MM:SS> <name> text
+- Input bar at bottom with doskeys (↑/↓ history, readline-style editing)
+- Header bar: channel name
+- Status area: show /exec output that isn't injected into channel
+
+
+CLI FLAGS
+---------
+  -p, --participants <file.json>   load participant definitions on startup
+  -l, --logfile <path>             log destination (default: ./logs/YYYY-MM-DD_HH-MM.log)
+      --no-log                     disable logging
+      --model <model-id>           default model for all participants
+      --channel <name>             channel name shown in header bar
+      --resume <logfile>           replay previous session history on load (no re-responses)
+      --theme <name>               color theme
+
+
+SLASH COMMANDS
+--------------
+Participants:
+  /add <name> [system_prompt]    add participant (opens $EDITOR if prompt omitted)
+  /remove <name>                 remove participant
+  /redefine <name>               edit system prompt in $EDITOR
+  /list, /names, /n              show all participants + truncated prompts
+  /mute <name>                   silence participant (still receives context)
+  /unmute <name>
+  /pause <name>                  freeze participant — no responses, no context accumulation
+  /unpause <name>
+  /solo <name>                   only receive responses from this participant
+  /solo                          clear solo mode
+  /save [file.json]              save participants to pretty-printed JSON (default: participants.json)
+  /load <file.json>              load/merge participants at runtime
+
+Messaging:
+  /reply <name> <message>        direct a message to one participant only
+  /exec [-e] <command>           run bash; -e injects stdout as channel message (triggers responses)
+                                 without -e: output shown in status area only, not logged or shared
+  /clear                         clear scroll buffer
+
+Session:
+  /log <path>                    change logfile mid-session
+  /log off                       pause logging
+  /theme [name]                  switch theme (lists available if no arg)
+  /help                          show commands
+  /quit
+
+
+MUTE vs PAUSE
+-------------
+/mute   — participant doesn't respond but keeps receiving context; can re-enter informed
+/pause  — fully frozen, no responses, no context; useful for bringing someone back cold
+          or from a specific reentry point
+
+
+PARTICIPANT JSON FORMAT
+-----------------------
+Pretty-printed, saved via /save:
+
+[
+  {
+    "name": "alice",
+    "system_prompt": "You are Alice, a witty Python developer who loves clean code.",
+    "model": "claude-opus-4-6"        // optional, falls back to --model or default
+  },
+  {
+    "name": "bob",
+    "system_prompt": "You are Bob, a pragmatic DevOps engineer obsessed with reliability.",
+    "model": "claude-opus-4-6"
+  }
+]
+
+
+PARALLEL RESPONSE STRATEGY
+---------------------------
+- Each participant queried via AsyncAnthropic + asyncio.gather
+- Streams tracked per participant
+- When first stream completes and posts, remaining tasks are cancelled
+- Remaining participants re-queried with updated history (first reply now included)
+- On non-Opus-4.6 models: optionally save partial text and use as assistant prefill
+  so participant "continues" their thought with new context — not available on Opus 4.6
+  (returns 400)
+
+
+MESSAGE HISTORY / ALTERNATION
+------------------------------
+Each participant sees the channel history formatted as alternating turns:
+- Their own previous messages → assistant turns
+- All other messages (grouped consecutive) → user turns
+Consecutive non-participant messages are merged into a single user turn to satisfy
+the API's alternation requirement.
+
+
+LOGGING
+-------
+- Enabled by default, timestamped filename under ./logs/
+- Plaintext IRC format:  [YYYY-MM-DD HH:MM:SS] <name> message
+- /exec output only logged if -e flag used (i.e. injected into channel)
+- --resume replays log into scroll buffer at startup with original timestamps;
+  participants receive history as context but do not re-respond
+
+
+MODEL
+-----
+- Default: claude-opus-4-6
+- Overridable per-participant in JSON or via future /model command
+- Haiku/Sonnet recommended for cost in large groups; enables prefill continuation trick
+
+
+TECH STACK
+----------
+- Python asyncio + anthropic (AsyncAnthropic)
+- curses (stdlib) for TUI
+- json (stdlib) for participant save/load
+- readline / custom doskey ring for input history
+- subprocess for /exec
