@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -77,6 +78,15 @@ DEFAULT_MAX_TOKENS = 4096
 IRC_MAX_CHARS    = 490   # RFC 1459 / RFC 2812 PRIVMSG payload headroom
 IRC_MAX_TOKENS   = 150   # generous token budget for one IRC line
 USER_SENDER      = "you"
+
+OLLAMA_PREFIX    = "ollama:"   # model ids with this prefix are served by local Ollama
+
+# Shown when the Anthropic models endpoint can't be reached.
+FALLBACK_ANTHROPIC_MODELS = [
+    "claude-opus-5-5",
+    "claude-sonnet-5",
+    "claude-haiku-4-5",
+]
 
 PARTICIPANT_PREAMBLE = (
     "You are on IRC. You pitch in on whatever comes up — debugging, life advice, "
@@ -316,6 +326,7 @@ class InputBar(Pane):
         self.history_pos     = -1
         self.history_draft   = ""   # draft saved while navigating history
         self.submit_callback = None  # callable(text) — sync, may schedule async work
+        self.back_callback   = None  # callable() — Ctrl-B returns to the model picker
 
     def update(self):
         attr   = palette(self.theme["input_fg"])
@@ -366,8 +377,9 @@ class InputBar(Pane):
             self.cursor = 0
         elif character == 5:                    # Ctrl-E  end of line
             self.cursor = len(self.buffer)
-        elif character == 2:                    # Ctrl-B  back char
-            self.cursor = max(0, self.cursor - 1)
+        elif character == 2:                    # Ctrl-B  back to model picker
+            if self.back_callback:
+                self.back_callback()
         elif character == 6:                    # Ctrl-F  forward char
             self.cursor = min(len(self.buffer), self.cursor + 1)
 
@@ -416,6 +428,144 @@ class InputBar(Pane):
                 pass
 
 
+class ModelPicker(Pane):
+    """Full-screen model list shown at startup and on Ctrl-B.
+
+    Rows are either section headings (not selectable) or model ids.
+    ↑/↓ PgUp/PgDn Home/End to move, Enter to choose, Esc to go back to chat.
+    """
+    geometry = [EXPAND, EXPAND]
+
+    def __init__(self, name: str, theme: dict = None):
+        super().__init__(name)
+        self.theme           = theme or THEMES["dark"]
+        self.rows: List[Tuple[str, Optional[str]]] = []  # (label, model_id | None)
+        self.selected        = 0
+        self.notice          = "Loading models…"
+        self.choose_callback = None  # callable(model_id)
+        self.cancel_callback = None  # callable()
+
+    def set_sections(self, sections: List[Tuple[str, List[str]]],
+                     current: Optional[str] = None):
+        """sections = [(heading, [model_id, …]), …]; empty sections are skipped."""
+        self.rows = []
+        for heading, models in sections:
+            if not models:
+                continue
+            self.rows.append((heading, None))
+            for m in models:
+                label = m[len(OLLAMA_PREFIX):] if m.startswith(OLLAMA_PREFIX) else m
+                self.rows.append((label, m))
+        self.notice   = "" if self.rows else "No models found."
+        selectable    = [i for i, (_, m) in enumerate(self.rows) if m]
+        self.selected = next(
+            (i for i in selectable if self.rows[i][1] == current),
+            selectable[0] if selectable else 0,
+        )
+
+    def _move(self, delta: int):
+        selectable = [i for i, (_, m) in enumerate(self.rows) if m]
+        if not selectable:
+            return
+        pos = selectable.index(self.selected) if self.selected in selectable else 0
+        pos = max(0, min(len(selectable) - 1, pos + delta))
+        self.selected = selectable[pos]
+
+    def update(self):
+        if not self.height or not self.width:
+            return
+        w        = self.width
+        head     = palette(self.theme["system_fg"])
+        normal   = palette(self.theme["input_fg"])
+        selected = palette(self.theme["header_fg"], self.theme["header_bg"])
+
+        lines: List[Tuple[str, int]] = [
+            (" Select a model  (↑/↓, Enter; Esc returns to chat)", head),
+            ("", normal),
+        ]
+        if self.notice:
+            lines.append(("  " + self.notice, head))
+        sel_line = 0
+        for i, (label, model) in enumerate(self.rows):
+            if model is None:
+                if i:
+                    lines.append(("", normal))
+                lines.append((f" {label}", head))
+            else:
+                if i == self.selected:
+                    sel_line = len(lines)
+                attr = selected if i == self.selected else normal
+                text = f"   {label}"
+                lines.append((text + " " * max(0, w - display_width(text)), attr))
+
+        # Keep the selected row on screen.
+        start = max(0, sel_line - self.height + 1)
+        self.content = [
+            [truncate_to_display_width(t, w) + "\n", ALIGN_LEFT, a]
+            for t, a in lines[start : start + self.height]
+        ]
+
+    def process_input(self, character: int):
+        if character == 259:                    # ↑
+            self._move(-1)
+        elif character == 258:                  # ↓
+            self._move(1)
+        elif character == 339:                  # PgUp
+            self._move(-(self.height or 10))
+        elif character == 338:                  # PgDn
+            self._move(self.height or 10)
+        elif character == 262:                  # Home
+            self._move(-len(self.rows))
+        elif character == 360:                  # End
+            self._move(len(self.rows))
+        elif character in (10, 13):             # Enter
+            if self.rows and self.rows[self.selected][1] and self.choose_callback:
+                self.choose_callback(self.rows[self.selected][1])
+        elif character == 27:                   # Esc
+            if self.cancel_callback:
+                self.cancel_callback()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model discovery
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ollama_base_url() -> str:
+    """Base URL of the local Ollama server, honouring $OLLAMA_HOST."""
+    host = os.environ.get("OLLAMA_HOST", "").strip() or "127.0.0.1:11434"
+    if "://" not in host:
+        host = "http://" + host
+    return host.rstrip("/").replace("://0.0.0.0", "://127.0.0.1")
+
+
+async def list_anthropic_models() -> List[str]:
+    try:
+        client = anthropic.AsyncAnthropic()
+        return [m.id async for m in client.models.list(limit=100)]
+    except Exception:
+        return list(FALLBACK_ANTHROPIC_MODELS)
+
+
+async def list_ollama_models() -> List[str]:
+    """Models installed in local Ollama, or [] if the server isn't reachable."""
+    def fetch() -> List[str]:
+        with urllib.request.urlopen(ollama_base_url() + "/api/tags", timeout=2) as r:
+            data = json.load(r)
+        return sorted(m["name"] for m in data.get("models", []))
+    try:
+        return [OLLAMA_PREFIX + name for name in await asyncio.to_thread(fetch)]
+    except Exception:
+        return []
+
+
+def client_for(model: str) -> Tuple[anthropic.AsyncAnthropic, str]:
+    """Return (client, api_model_id).  Ollama speaks the Anthropic Messages API."""
+    if model.startswith(OLLAMA_PREFIX):
+        client = anthropic.AsyncAnthropic(base_url=ollama_base_url(), api_key="ollama")
+        return client, model[len(OLLAMA_PREFIX):]
+    return anthropic.AsyncAnthropic(), model
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Application
 # ─────────────────────────────────────────────────────────────────────────────
@@ -448,12 +598,69 @@ class ThinktankApp:
         self.scroll   = ScrollBuffer("scroll", theme=self.theme)
         self.status   = StatusBar("status",   theme=self.theme)
         self.inputbar = InputBar("input",     theme=self.theme)
+        self.picker   = ModelPicker("picker", theme=self.theme)
 
         self.status.hidden           = True
         self.inputbar.submit_callback = self._on_submit
+        self.inputbar.back_callback   = self._show_picker
+        self.picker.choose_callback   = self._choose_model
+        self.picker.cancel_callback   = self._hide_picker
 
-        for pane in (self.header, self.scroll, self.status, self.inputbar):
+        for pane in (self.header, self.picker, self.scroll, self.status, self.inputbar):
             self.window.add(pane)
+
+        self._picking        = False
+        self._status_visible = False
+        self._model_chosen   = False
+
+    # ── Model picker ─────────────────────────────────────────────────────────
+
+    def _set_picking(self, picking: bool):
+        if picking and not self._picking:
+            self._status_visible = not self.status.hidden
+        self._picking       = picking
+        self.picker.hidden  = not picking
+        self.picker.active  = picking
+        for pane in (self.scroll, self.inputbar):
+            pane.hidden = picking
+            pane.active = not picking
+        self.status.hidden = picking or not self._status_visible
+        if self.window.window:
+            self.window.window.clear()
+        if picking:
+            self.header.right = " [select model] "
+        else:
+            self._update_header_right()
+
+    def _show_picker(self):
+        self._set_picking(True)
+        if self._loop:
+            self._loop.create_task(self._refresh_models())
+
+    def _hide_picker(self):
+        if self._model_chosen:      # nothing to go back to before the first pick
+            self._set_picking(False)
+
+    async def _refresh_models(self):
+        self.picker.notice = "Loading models…"
+        claude, local = await asyncio.gather(
+            list_anthropic_models(), list_ollama_models()
+        )
+        self.picker.set_sections(
+            [("Anthropic", claude), (f"Ollama ({ollama_base_url()})", local)],
+            current=self.default_model,
+        )
+
+    def _choose_model(self, model: str):
+        """Make *model* the model for every participant and return to chat."""
+        changed             = model != self.default_model or not self._model_chosen
+        self.default_model  = model
+        self._model_chosen  = True
+        for p in self.participants.values():
+            p.model = model
+        self._set_picking(False)
+        if changed:
+            self._system_message(f"Model: {model}")
 
     # ── Logging ──────────────────────────────────────────────────────────────
 
@@ -507,7 +714,7 @@ class ThinktankApp:
         n    = len(self.participants)
         mode = "C" if self.constrained else "F"
         pstr = f"{n}p " if n else ""
-        self.header.right = f" [{pstr}{mode}] "
+        self.header.right = f" [{self.default_model}] [{pstr}{mode}] "
 
     # ── API context building ──────────────────────────────────────────────────
 
@@ -576,19 +783,26 @@ class ThinktankApp:
         if self.constrained:
             system = system + CONSTRAIN_SYSTEM_SUFFIX
 
-        client    = anthropic.AsyncAnthropic()
-        full_text = ""
+        client, api_model = client_for(participant.model)
+        full_text         = ""
 
         try:
             if self.constrained:
+                # Local thinking models can spend a small budget entirely on
+                # reasoning, so give Ollama room; the reply is truncated anyway.
+                local = participant.model.startswith(OLLAMA_PREFIX)
                 resp = await client.messages.create(
-                    model=participant.model,
-                    max_tokens=IRC_MAX_TOKENS,
+                    model=api_model,
+                    max_tokens=DEFAULT_MAX_TOKENS if local else IRC_MAX_TOKENS,
                     system=system,
                     messages=messages,
                 )
-                raw       = resp.content[0].text if resp.content else ""
-                full_text = raw.splitlines()[0].strip()[:IRC_MAX_CHARS]
+                # Skip thinking blocks some local models emit ahead of the text.
+                raw       = "".join(
+                    b.text for b in resp.content if getattr(b, "type", "") == "text"
+                )
+                lines     = raw.strip().splitlines()
+                full_text = lines[0].strip()[:IRC_MAX_CHARS] if lines else ""
                 return participant.name, full_text
 
             else:
@@ -598,7 +812,7 @@ class ThinktankApp:
                     if prefill else messages
                 )
                 async with client.messages.stream(
-                    model=participant.model,
+                    model=api_model,
                     max_tokens=DEFAULT_MAX_TOKENS,
                     system=system,
                     messages=api_messages,
@@ -1007,7 +1221,7 @@ class ThinktankApp:
             return
         self.theme_name = name
         self.theme      = THEMES[name]
-        for pane in (self.header, self.scroll, self.status, self.inputbar):
+        for pane in (self.header, self.picker, self.scroll, self.status, self.inputbar):
             pane.theme = self.theme
         self.scroll._colors.clear()
         self._ensure_color(USER_SENDER)
@@ -1053,6 +1267,7 @@ class ThinktankApp:
             "  /help                  /quit",
             "Keys:",
             "  ↑/↓ in input box → command history",
+            "  Ctrl-B               → back to the model list",
             "  PgUp/PgDn            → scroll buffer",
         ]
         for line in lines:
@@ -1170,6 +1385,10 @@ class ThinktankApp:
         _curses.cbreak()
         _curses.nonl()
         win.nodelay(1)
+        try:
+            _curses.set_escdelay(25)    # make Esc in the model picker responsive
+        except Exception:
+            pass
         self.window.window  = win
         self.window.running = True
 
@@ -1194,9 +1413,10 @@ class ThinktankApp:
                     self._system_message(f"Log error: {exc}")
 
             self._system_message(
-                f"Welcome to {self.channel}  —  /help for commands, /quit to exit"
+                f"Welcome to {self.channel}  —  /help for commands, "
+                "Ctrl-B for models, /quit to exit"
             )
-            self._update_header_right()
+            self._show_picker()
 
             while self.window.running:
                 self.window.cycle()
@@ -1242,7 +1462,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--model", metavar="MODEL-ID",
-        help=f"default model for all participants (default: {DEFAULT_MODEL})",
+        help=f"model highlighted in the startup model list (default: {DEFAULT_MODEL})",
     )
     p.add_argument(
         "--channel", metavar="NAME",
