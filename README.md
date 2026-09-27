@@ -12,7 +12,7 @@ their own persona, reply to you (and each other) in a single curses channel.
 Requires Python 3.10+ and an [Anthropic API key](https://console.anthropic.com/).
 
 ```bash
-git clone <this repo> && cd thinktank
+git clone https://github.com/float64co/thinktank && cd thinktank
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
 export ANTHROPIC_API_KEY=sk-ant-...
